@@ -1,69 +1,274 @@
 /**
  * K8s Service Loader Script
  *
- * @version 0.0.1
+ * @version 0.0.2
  * @date 2024-08-30
  * @license MIT
  * @repository https://github.com/oijusti/k8s-service-loader-script
  * @description This script lists Kubernetes services by fetching pod details
  *   using kubectl and allows the user to forward ports for a selected service.
+ *
+ * @usage
+ *   Basic Usage: node ./k8s-service-loader-script.js
+ *   With Namespace: node ./k8s-service-loader-script.js --namespace <NAMESPACE>
  */
+
+const metadata = {
+  version: "0.0.2",
+  date: "2024-08-30",
+  license: "MIT",
+  repository: "https://github.com/oijusti/k8s-service-loader-script",
+};
 
 const { exec, spawn } = require("child_process");
 const readline = require("readline");
+const EventEmitter = require("events");
 
-const metadata = {
-  version: "0.0.1",
-};
+class DataEmitter extends EventEmitter {}
+const dataEmitter = new DataEmitter();
 
-const colors = {
+const rl = readline.createInterface({
+  input: process.stdin,
+  output: process.stdout,
+});
+
+const spinner = new Spinner();
+
+const c = {
   reset: "\x1b[0m",
-  bright: "\x1b[1m",
-  dim: "\x1b[2m",
-  underscore: "\x1b[4m",
-  blink: "\x1b[5m",
-  reverse: "\x1b[7m",
-  hidden: "\x1b[8m",
-
-  fgBlack: "\x1b[30m",
-  fgRed: "\x1b[31m",
-  fgGreen: "\x1b[32m",
-  fgYellow: "\x1b[33m",
-  fgBlue: "\x1b[34m",
-  fgMagenta: "\x1b[35m",
-  fgCyan: "\x1b[36m",
-  fgWhite: "\x1b[37m",
-
-  bgBlack: "\x1b[40m",
-  bgRed: "\x1b[41m",
-  bgGreen: "\x1b[42m",
-  bgYellow: "\x1b[43m",
-  bgBlue: "\x1b[44m",
-  bgMagenta: "\x1b[45m",
-  bgCyan: "\x1b[46m",
-  bgWhite: "\x1b[47m",
+  red: "\x1b[31m",
+  green: "\x1b[32m",
+  yellow: "\x1b[33m",
+  magenta: "\x1b[35m",
+  cyan: "\x1b[36m",
 };
 
-console.log(`${colors.fgCyan}K8s Service Loader Script${colors.reset}`);
-console.log(`${colors.fgYellow}Version: ${metadata.version}${colors.reset}`);
+const main = async () => {
+  print(c.yellow, "☸️  K8s Service Loader Script");
+  print(c.cyan, metadata.repository);
+  print(c.cyan, `Version: ${metadata.version}`);
+  print(c.cyan, "Usage:");
+  print(c.cyan, "  node ./k8s-service-loader-script.js");
+  print(
+    c.cyan,
+    "  node ./k8s-service-loader-script.js --namespace <NAMESPACE>"
+  );
 
-console.log(`${colors.fgGreen}Loading services, please wait...${colors.reset}`);
+  let namespace = getArgValue("--namespace");
 
-exec("kubectl get pods --all-namespaces", (error, stdout, stderr) => {
-  if (error) {
-    console.error(
-      `${colors.fgRed}Error executing kubectl: ${error.message}${colors.reset}`
+  const getPodsCommand = namespace
+    ? `kubectl get pods --namespace ${namespace}`
+    : "kubectl get pods --all-namespaces";
+
+  print(c.green, `\n> ${getPodsCommand}`);
+  spinner.start("Loading services");
+
+  try {
+    const podsData = await execPromise(getPodsCommand);
+    spinner.stop();
+
+    const servicesMap = getServicesMap(podsData, namespace);
+    const servicesList = Array.from(servicesMap.keys()).sort();
+
+    if (servicesList.length === 0) {
+      print(c.magenta, "No services found.");
+      rl.close();
+      return;
+    }
+
+    print(c.magenta, "\nServices found:");
+    servicesList.forEach((service, index) => {
+      print(c.green, `[${index + 1}] ${service}`);
+    });
+
+    const serviceAnswer = await prompt(
+      colorText(c.yellow, "Select a service by typing a number: ")
     );
-    return;
+    const selectedIndex = parseInt(serviceAnswer) - 1;
+
+    if (
+      isNaN(selectedIndex) ||
+      selectedIndex < 0 ||
+      selectedIndex >= servicesList.length
+    ) {
+      console.error(
+        "Invalid selection. Please run the script again and choose a valid number."
+      );
+      rl.close();
+      return;
+    }
+
+    const selectedService = servicesList[selectedIndex];
+    print(c.cyan, `You selected: ${selectedService}`);
+
+    print(c.magenta, "\nEnvironments:");
+    print(c.green, "[1] dev");
+    print(c.green, "[2] qa");
+    print(c.green, "[3] stg");
+
+    const envAnswer = await prompt(
+      colorText(
+        c.yellow,
+        "Select an environment by typing a number (default: 1): "
+      )
+    );
+    const envChoice = parseInt(envAnswer) || 1;
+
+    let environment;
+    if (envChoice === 1) {
+      environment = "dev";
+    } else if (envChoice === 2) {
+      environment = "qa";
+    } else if (envChoice === 3) {
+      environment = "stg";
+    } else {
+      console.error(
+        "Invalid selection. Please run the script again and choose either '1', '2', or '3'."
+      );
+      rl.close();
+      return;
+    }
+
+    const serviceDetails = servicesMap.get(selectedService)[environment];
+
+    if (!serviceDetails) {
+      console.error(
+        `The selected environment "${environment}" does not exist for the service "${selectedService}". Please run the script again and choose a valid environment.`
+      );
+      rl.close();
+      return;
+    }
+
+    const serviceId = serviceDetails.id;
+    namespace = namespace ?? serviceDetails.namespace;
+
+    const localPortAnswer = await prompt(
+      colorText(
+        c.yellow,
+        "\nEnter the local port to run the service (default: 3000): "
+      )
+    );
+    const localPort = localPortAnswer || "3000";
+
+    const getServicePortCommand = `kubectl get service --namespace ${namespace} ${environment}-${namespace}-${selectedService} -o jsonpath={.spec.ports[*].port}`;
+    print(c.green, `\n> ${getServicePortCommand}`);
+
+    spinner.start("Detecting port on the Kubernetes service");
+    const servicePortDetected = await execPromise(getServicePortCommand);
+    spinner.stop();
+    print(c.cyan, `Port detected: ${servicePortDetected}\n`);
+
+    const servicePortAnswer = await prompt(
+      colorText(
+        c.yellow,
+        `Enter the destination port on the Kubernetes service. Try using port 3000 if the detected port fails (default: ${servicePortDetected}): `
+      )
+    );
+    const servicePort = servicePortAnswer || `${servicePortDetected}`;
+
+    const portForwardCommand = `kubectl port-forward --namespace ${namespace} ${environment}-${namespace}-${selectedService}-${serviceId} ${localPort}:${servicePort}`;
+    const logsCommand = `kubectl logs --namespace ${namespace} ${environment}-${namespace}-${selectedService}-${serviceId} -f`;
+
+    print(c.green, `\n> ${portForwardCommand}`);
+    spinner.start("Initializing port forwarding");
+
+    const portForwardProcess = spawn(
+      "kubectl",
+      portForwardCommand.split(" ").slice(1)
+    );
+
+    let portForwardFirstTime = true;
+
+    portForwardProcess.stdout.on("data", async (data) => {
+      if (portForwardFirstTime) spinner.stop();
+
+      print(c.green, `\n${data}`);
+      print(c.magenta, `Service available at: http://localhost:${localPort}`);
+
+      if (!portForwardFirstTime) return;
+      portForwardFirstTime = false;
+
+      dataEmitter.emit("portForwardDataReceived", logsCommand);
+    });
+
+    portForwardProcess.stderr.on("data", (data) => {
+      console.error(`\n${data}`);
+    });
+
+    portForwardProcess.on("close", (code) => {
+      print(c.cyan, `\nPort-forward process exited with code ${code}`);
+    });
+  } catch (error) {
+    spinner.stop();
+    console.error(`${error.message}`);
+    rl.close();
+  }
+};
+
+async function handleLogsProcess(logsCommand) {
+  await sleep(500);
+
+  const logsAnswer = await prompt(
+    colorText(
+      c.yellow,
+      "\nWould you like to see the logs in real time? (Y/n): "
+    )
+  );
+  const logsChoice = logsAnswer.toLowerCase() || "y";
+
+  if (logsChoice === "y" || logsChoice === "yes") {
+    print(c.green, `\n> ${logsCommand}`);
+    spinner.start("Fetching logs for the pod");
+
+    const logsProcess = spawn("kubectl", logsCommand.split(" ").slice(1));
+
+    let logsFirstTime = true;
+
+    logsProcess.stdout.on("data", (data) => {
+      if (logsFirstTime) spinner.stop();
+      logsFirstTime = false;
+      print(c.reset, `${data}`);
+    });
+
+    logsProcess.stderr.on("data", (data) => {
+      console.error(`${data}`);
+    });
+
+    logsProcess.on("close", (code) => {
+      print(c.cyan, `Logs process exited with code ${code}`);
+    });
+  } else {
+    print(c.cyan, "Skipping logs.");
   }
 
-  if (stderr) {
-    console.error(`${colors.fgRed}stderr: ${stderr}${colors.reset}`);
-    return;
-  }
+  rl.close();
+}
 
-  const lines = stdout.trim().split("\n");
+dataEmitter.on("portForwardDataReceived", handleLogsProcess);
+
+main();
+
+/**
+ * Helpers
+ */
+
+function execPromise(cmd) {
+  return new Promise((resolve, reject) => {
+    exec(cmd, (error, stdout, stderr) => {
+      if (error) {
+        reject(error);
+      } else if (stderr) {
+        reject(new Error(stderr));
+      } else {
+        resolve(stdout);
+      }
+    });
+  });
+}
+
+function getServicesMap(podsData, namespace) {
   const servicesMap = new Map();
+  const lines = podsData.trim().split("\n");
 
   // Get headers to find indices
   const headers = lines[0].split(/\s+/);
@@ -72,7 +277,7 @@ exec("kubectl get pods --all-namespaces", (error, stdout, stderr) => {
 
   for (let i = 1; i < lines.length; i++) {
     const columns = lines[i].split(/\s+/);
-    const namespaceColumn = columns[namespaceIndex];
+    const namespaceColumn = namespace ?? columns[namespaceIndex];
     const nameColumn = columns[nameIndex];
 
     // Only include services that start with "dev-", "qa-" or "stg-"
@@ -111,134 +316,64 @@ exec("kubectl get pods --all-namespaces", (error, stdout, stderr) => {
       };
     }
   }
+  return servicesMap;
+}
 
-  // Convert services to a sorted array
-  const serviceList = Array.from(servicesMap.keys()).sort();
-
-  console.log(`${colors.fgCyan}Services found:${colors.reset}`);
-  serviceList.forEach((service, index) => {
-    console.log(`${colors.fgGreen}[${index + 1}] ${service}${colors.reset}`);
-  });
-
-  if (serviceList.length === 0) {
-    console.log(`${colors.fgMagenta}No services found.${colors.reset}`);
-    return;
-  }
-
-  const rl = readline.createInterface({
-    input: process.stdin,
-    output: process.stdout,
-  });
-
-  rl.question(
-    `${colors.fgYellow}Please select a service by typing a number: ${colors.reset}`,
-    (answer) => {
-      const selectedIndex = parseInt(answer) - 1;
-
-      if (selectedIndex >= 0 && selectedIndex < serviceList.length) {
-        const selectedService = serviceList[selectedIndex];
-        console.log(
-          `${colors.fgCyan}You selected: ${selectedService}${colors.reset}`
-        );
-
-        console.log(`${colors.fgYellow}Select an environment:${colors.reset}`);
-        console.log(`${colors.fgGreen}[1] dev${colors.reset}`);
-        console.log(`${colors.fgGreen}[2] qa${colors.reset}`);
-        console.log(`${colors.fgGreen}[3] stg${colors.reset}`);
-
-        rl.question(
-          `${colors.fgYellow}Enter your choice (1, 2, or 3): ${colors.reset}`,
-          (envChoice) => {
-            let environment;
-            if (envChoice === "1") {
-              environment = "dev";
-            } else if (envChoice === "2") {
-              environment = "qa";
-            } else if (envChoice === "3") {
-              environment = "stg";
-            } else {
-              console.log(
-                `${colors.fgRed}Invalid selection. Please run the script again and choose either "1", "2", or "3".${colors.reset}`
-              );
-              rl.close();
-              return;
-            }
-
-            const serviceDetails =
-              servicesMap.get(selectedService)[environment];
-
-            // Check if service details exist for the chosen environment
-            if (!serviceDetails) {
-              console.log(
-                `${colors.fgRed}The selected environment "${environment}" does not exist for the service "${selectedService}". Please run the script again and choose a valid environment.${colors.reset}`
-              );
-              rl.close();
-              return;
-            }
-
-            const serviceId = serviceDetails.id;
-            const namespace = serviceDetails.namespace;
-
-            rl.question(
-              `${colors.fgYellow}Enter the local port to run the service (default is 3000): ${colors.reset}`,
-              (portInput) => {
-                const localPort = portInput.trim() || "3000";
-
-                const portForwardCommand = `kubectl port-forward --namespace ${namespace} ${environment}-${namespace}-${selectedService}-${serviceId} ${localPort}:3000`;
-
-                console.log(
-                  `${colors.fgCyan}Generated command:${colors.reset}`
-                );
-                console.log(
-                  `${colors.fgGreen}${portForwardCommand}${colors.reset}`
-                );
-
-                console.log(
-                  `${colors.fgGreen}Running the port-forward command, please wait...${colors.reset}`
-                );
-
-                // Execute the port-forward command using spawn
-                const child = spawn("kubectl", [
-                  "port-forward",
-                  "--namespace",
-                  namespace,
-                  `${environment}-${namespace}-${selectedService}-${serviceId}`,
-                  `${localPort}:3000`,
-                ]);
-
-                // Stream the output of the command
-                child.stdout.on("data", (data) => {
-                  console.log(
-                    `${colors.fgGreen}stdout: ${data}${colors.reset}`
-                  );
-                  console.log(
-                    `${colors.fgMagenta}Service available at: http://localhost:${localPort}${colors.reset}`
-                  );
-                });
-
-                child.stderr.on("data", (data) => {
-                  console.error(
-                    `${colors.fgRed}stderr: ${data}${colors.reset}`
-                  );
-                });
-
-                child.on("close", (code) => {
-                  console.log(
-                    `${colors.fgCyan}Child process exited with code ${code}${colors.reset}`
-                  );
-                });
-
-                rl.close();
-              }
-            );
-          }
-        );
-      } else {
-        console.log(
-          `${colors.fgRed}Invalid selection. Please run the script again and choose a valid number.${colors.reset}`
-        );
-        rl.close();
-      }
+function getArgValue(flag) {
+  // Parse command line arguments
+  const args = process.argv.slice(2);
+  for (let i = 0; i < args.length; i++) {
+    if (args[i] === flag && args[i + 1]) {
+      return args[i + 1];
     }
-  );
-});
+  }
+  return null;
+}
+
+function prompt(question) {
+  return new Promise((resolve) => {
+    rl.question(question, (answer) => resolve(answer.trim()));
+  });
+}
+
+function colorText(colorCode, text) {
+  const reset = "\x1b[0m";
+  return `${colorCode}${text}${reset}`;
+}
+
+function print(colorCode, text) {
+  return console.log(colorText(colorCode, text));
+}
+
+function sleep(ms) {
+  return new Promise((resolve) => setTimeout(resolve, ms));
+}
+
+function Spinner() {
+  const spinnerChars = ["⠋", "⠙", "⠹", "⠸", "⠼", "⠴", "⠦", "⠧", "⠇", "⠏"];
+  let index = 0;
+  let intervalId = null;
+  let message = "";
+
+  return {
+    start(newMessage) {
+      if (intervalId) return; // Spinner is already running
+
+      message = newMessage;
+      process.stdout.write(`${message}...`); // Write the message first
+
+      intervalId = setInterval(() => {
+        process.stdout.write(`\r${message}...${spinnerChars[index]}`);
+        index = (index + 1) % spinnerChars.length;
+      }, 100); // Adjust the speed by changing the interval (in milliseconds)
+    },
+
+    stop() {
+      if (intervalId) {
+        clearInterval(intervalId);
+        intervalId = null;
+        process.stdout.write(`\r${message}...done.\n`); // Overwrite the spinner with "done."
+      }
+    },
+  };
+}
