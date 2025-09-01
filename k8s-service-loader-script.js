@@ -1,7 +1,7 @@
 /**
  * K8s Service Loader Script
  *
- * @version 0.0.2
+ * @version 0.0.3
  * @date 2024-08-30
  * @license MIT
  * @repository https://github.com/oijusti/k8s-service-loader-script
@@ -14,7 +14,7 @@
  */
 
 const metadata = {
-  version: "0.0.2",
+  version: "0.0.3",
   date: "2024-08-30",
   license: "MIT",
   repository: "https://github.com/oijusti/k8s-service-loader-script",
@@ -101,34 +101,30 @@ const main = async () => {
     const selectedService = servicesList[selectedIndex];
     print(c.cyan, `You selected: ${selectedService}`);
 
+    const availableEnvs = Object.keys(servicesMap.get(selectedService) || {});
+
     print(c.magenta, "\nEnvironments:");
-    print(c.green, "[1] dev");
-    print(c.green, "[2] qa");
-    print(c.green, "[3] stg");
+    availableEnvs.forEach((env, index) => {
+      print(c.green, `[${index + 1}] ${env}`);
+    });
 
     const envAnswer = await prompt(
       colorText(
         c.yellow,
-        "Select an environment by typing a number (default: 1): "
+        `Select an environment by typing a number (default: 1): `
       )
     );
     const envChoice = parseInt(envAnswer) || 1;
 
-    let environment;
-    if (envChoice === 1) {
-      environment = "dev";
-    } else if (envChoice === 2) {
-      environment = "qa";
-    } else if (envChoice === 3) {
-      environment = "stg";
-    } else {
+    if (envChoice < 1 || envChoice > availableEnvs.length) {
       console.error(
-        "Invalid selection. Please run the script again and choose either '1', '2', or '3'."
+        `Invalid selection. Please run the script again and choose a number between 1 and ${availableEnvs.length}.`
       );
       rl.close();
       return;
     }
 
+    const environment = availableEnvs[envChoice - 1];
     const serviceDetails = servicesMap.get(selectedService)[environment];
 
     if (!serviceDetails) {
@@ -140,7 +136,8 @@ const main = async () => {
     }
 
     const serviceId = serviceDetails.id;
-    namespace = namespace ?? serviceDetails.namespace;
+    const serviceName = serviceDetails.serviceName;
+    const serviceNamespace = namespace ?? serviceDetails.namespace;
 
     const localPortAnswer = await prompt(
       colorText(
@@ -150,7 +147,7 @@ const main = async () => {
     );
     const localPort = localPortAnswer || "3000";
 
-    const getServicePortCommand = `kubectl get service --namespace ${namespace} ${environment}-${namespace}-${selectedService} -o jsonpath={.spec.ports[*].port}`;
+    const getServicePortCommand = `kubectl get service --namespace ${serviceNamespace} ${serviceName} -o jsonpath={.spec.ports[*].port}`;
     print(c.green, `\n> ${getServicePortCommand}`);
 
     spinner.start("Detecting port on the Kubernetes service");
@@ -166,8 +163,8 @@ const main = async () => {
     );
     const servicePort = servicePortAnswer || `${servicePortDetected}`;
 
-    const portForwardCommand = `kubectl port-forward --namespace ${namespace} ${environment}-${namespace}-${selectedService}-${serviceId} ${localPort}:${servicePort}`;
-    const logsCommand = `kubectl logs --namespace ${namespace} ${environment}-${namespace}-${selectedService}-${serviceId} -f`;
+    const portForwardCommand = `kubectl port-forward --namespace ${serviceNamespace} ${serviceName}-${serviceId} ${localPort}:${servicePort}`;
+    const logsCommand = `kubectl logs --namespace ${serviceNamespace} ${serviceName}-${serviceId} -f`;
 
     print(c.green, `\n> ${portForwardCommand}`);
     spinner.start("Initializing port forwarding");
@@ -274,13 +271,21 @@ function getServicesMap(podsData, namespace) {
   const headers = lines[0].split(/\s+/);
   const namespaceIndex = headers.indexOf("NAMESPACE");
   const nameIndex = headers.indexOf("NAME");
+  const statusIndex = headers.indexOf("STATUS");
 
   for (let i = 1; i < lines.length; i++) {
     const columns = lines[i].split(/\s+/);
+
+    // Read STATUS column (if present) and skip non-Running entries
+    const statusColumn = statusIndex !== -1 ? columns[statusIndex] : undefined;
+    if (statusColumn !== undefined && statusColumn !== "Running") {
+      continue;
+    }
+
     const namespaceColumn = namespace ?? columns[namespaceIndex];
     const nameColumn = columns[nameIndex];
 
-    // Only include services that start with "dev-", "qa-" or "stg-"
+    // Categorize services by environment based on prefix: "dev-", "qa-", "stg-", "prod-", or "default"
     let envPrefix = "";
     if (nameColumn.startsWith("dev-")) {
       envPrefix = "dev";
@@ -288,31 +293,32 @@ function getServicesMap(podsData, namespace) {
       envPrefix = "qa";
     } else if (nameColumn.startsWith("stg-")) {
       envPrefix = "stg";
+    } else if (nameColumn.startsWith("prod-")) {
+      envPrefix = "prod";
     } else {
-      continue; // Skip this service as it does not start with "dev-", "qa-" or "stg-"
+      envPrefix = "default";
     }
 
-    let modifiedName = nameColumn.replace(/^(dev-|qa-|stg-)/, "");
-
-    // Remove namespace part found in the namespace column
-    if (namespaceColumn) {
-      modifiedName = modifiedName.replace(
-        new RegExp(`^${namespaceColumn}-`, "g"),
-        ""
-      );
-    }
-
-    // Split the remaining parts by "-" and extract the last two parts as the ID
-    const parts = modifiedName.split("-");
+    const parts = nameColumn.split("-");
     if (parts.length > 2) {
       const serviceName = parts.slice(0, -2).join("-");
       const serviceId = parts.slice(-2).join("-");
-      if (!servicesMap.has(serviceName)) {
-        servicesMap.set(serviceName, {});
+
+      let shortServiceName = serviceName.replace(/^(dev-|qa-|stg-|prod-)/, "");
+      if (namespaceColumn) {
+        shortServiceName = shortServiceName.replace(
+          new RegExp(`^${namespaceColumn}-`, "g"),
+          ""
+        );
       }
-      servicesMap.get(serviceName)[envPrefix] = {
+
+      if (!servicesMap.has(shortServiceName)) {
+        servicesMap.set(shortServiceName, {});
+      }
+      servicesMap.get(shortServiceName)[envPrefix] = {
         id: serviceId,
         namespace: namespaceColumn,
+        serviceName,
       };
     }
   }
